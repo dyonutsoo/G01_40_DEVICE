@@ -1,0 +1,499 @@
+// copy and paste this code into your arduino IDE
+
+#include <LiquidCrystal_I2C.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Keypad.h>
+#include "pitches.h"
+
+// Define your WiFi credentials
+const char* ssid = "putao"; // B-25-23A
+const char* password = "Edward123"; // Buddy23A
+
+// Define your Firebase configuration
+const char* firebaseHost = "door-security-lock-c2216-default-rtdb.firebaseio.com";
+const char* firebaseAuth = "AIzaSyBXCz3oloUKASYlqtqS5QOkjj11J1JsncM";
+const char* userDatabasePath = "/users-rfid";
+const char* accessLogPath = "/access-logs.json";
+
+#define SS_PIN 5
+#define RST_PIN 27
+#define LG_PIN 25 // Define the green LED pin
+#define BUZZER_PIN 32 // Define buzzer
+#define RELAY_PIN 33
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+bool tagScanned = false;
+bool accessGranted = false; // Track access status
+String fetchedKeypadPass = "";
+bool isFetchingKeypadPass = false; // State to track when to fetch the keypadPass
+
+// Define keypad structure
+const byte ROWS = 4; // Four rows
+const byte COLS = 3; // Three columns
+
+char keys[ROWS][COLS] = {
+  {'1', '2', '3'},
+  {'4', '5', '6'},
+  {'7', '8', '9'},
+  {'*', '0', '#'}
+};
+
+byte rowPins[ROWS] = {4, 14, 12, 13}; // Row pins
+byte colPins[COLS] = {0, 17, 26};    // Column pins
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+unsigned long debounceTime = 50; // Set your desired debounce time (milliseconds)
+unsigned long lastKeyPressTime = 0;
+char lastKey = '\0';
+
+bool keypadEvent = false;
+String enteredPassword = "";
+bool passwordMode = false;
+
+int accessGrantedMelody[] = {
+  NOTE_C4, NOTE_G4, NOTE_E5
+};
+
+int accessDeniedMelody[] = {
+  NOTE_A4, NOTE_B4, NOTE_C5
+};
+
+int noteDurations[] = {
+  4, 8, 8
+};
+
+void setup() {
+  Serial.begin(115200);
+  SPI.begin();
+  rfid.PCD_Init();
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LG_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print("Connecting...");
+    lcd.clear();
+    lcd.setCursor(1, 0);
+    lcd.print("Connecting...");
+    lcd.setCursor(1, 1);
+    lcd.print("Please wait...");
+    delay(5000);
+  }
+  lcd.clear();
+  lcd.setCursor(1, 0);
+  lcd.print("WiFi Connected");
+  delay(500);
+}
+
+void unlockDoor() {
+  digitalWrite(RELAY_PIN, HIGH);
+  delay(1000);
+  digitalWrite(RELAY_PIN, LOW);
+}
+
+void playMelody(int melodyType) {
+  int* melodyToPlay = (melodyType == 1) ? accessGrantedMelody : accessDeniedMelody;
+
+  for (int thisNote = 0; thisNote < 1; thisNote++) { // Play one note longer for access denied
+    int noteDuration = 1000 / noteDurations[thisNote];
+    tone(BUZZER_PIN, melodyToPlay[thisNote], noteDuration);
+    int pauseBetweenNotes = noteDuration * 1.30;
+    delay(pauseBetweenNotes);
+    noTone(BUZZER_PIN);
+  }
+}
+
+// Function to add a new user with blank details to the Firebase database
+void addBlankUserToFirebase(String uid) {
+  // Fetch the existing users from the Firebase database
+  HTTPClient http;
+  String firebaseUrl = "https://" + String(firebaseHost) + userDatabasePath + ".json?auth=" + String(firebaseAuth);
+
+  if (http.begin(firebaseUrl)) {
+    int httpResponseCode = http.GET();
+    if (httpResponseCode > 0) {
+      String payload = http.getString();
+      DynamicJsonDocument doc(2048);
+      deserializeJson(doc, payload);
+
+      // Check if the user with the same keypad password already exists in the database
+      if (doc.containsKey(uid)) {
+        JsonObject existingUser = doc[uid].as<JsonObject>();
+        String existingKeypadPass = existingUser["keypadPass"].as<String>();
+        if (existingKeypadPass != "") {
+          Serial.println("User with the same keypad password already exists in the database. Skipping addition.");
+          return;
+        }
+      }
+    } else {
+      Serial.print("Error fetching existing users. HTTP Error: ");
+      Serial.println(httpResponseCode);
+    }
+
+    http.end();
+  } else {
+    Serial.println("Failed to connect to Firebase");
+  }
+
+  // If no user with the same keypad password exists, add the new user
+  HTTPClient addHttp;
+  String addFirebaseUrl = "https://" + String(firebaseHost) + userDatabasePath + "/" + uid + ".json?auth=" + String(firebaseAuth);
+
+  DynamicJsonDocument newUser(2048);
+  newUser["uid"] = uid;
+  newUser["keypadPass"] = ""; // Empty keypad password
+  newUser["name"] = "";       // Empty name
+  newUser["email"] = "";      // Empty email
+  newUser["phone"] = "";      // Empty phone
+
+  String newUserJson;
+  serializeJson(newUser, newUserJson);
+
+  addHttp.begin(addFirebaseUrl);
+  addHttp.addHeader("Content-Type", "application/json");
+  int addHttpResponseCode = addHttp.PUT(newUserJson);
+
+  if (addHttpResponseCode > 0) {
+    Serial.print("Blank User Added to Firebase. Response Code: ");
+    Serial.println(addHttpResponseCode);
+  } else {
+    Serial.print("Error adding blank user to Firebase. HTTP Error: ");
+    Serial.println(addHttpResponseCode);
+  }
+
+  addHttp.end();
+}
+
+String getUserDisplayName(String uid) {
+  HTTPClient http;
+  String firebaseUrl = "https://" + String(firebaseHost) + userDatabasePath + ".json?auth=" + String(firebaseAuth);
+
+  if (http.begin(firebaseUrl)) {
+    int httpResponseCode = http.GET();
+    if (httpResponseCode > 0) {
+      String payload = http.getString();
+      DynamicJsonDocument doc(2048);
+      deserializeJson(doc, payload);
+
+      if (doc.containsKey(uid)) {
+        String userName = doc[uid]["name"];
+        http.end();
+        return userName; // Return the user's name
+      }
+    } else {
+      Serial.print("Error fetching user's name. HTTP Error: ");
+      Serial.println(httpResponseCode);
+    }
+
+    http.end();
+  } else {
+    Serial.println("Failed to connect to Firebase");
+  }
+
+  return "Unknown"; // If user's name is not found
+}
+
+void sendAccessLogToFirebase(String uid, String status, String logType, String password) {
+  HTTPClient http;
+  String firebaseUrl;
+  String logData;
+
+  if (logType == "RFID") {
+    firebaseUrl = "https://" + String(firebaseHost) + accessLogPath + "?auth=" + String(firebaseAuth);
+    
+    // Fetch the user's name based on the UID from the database
+    String userName = getUserDisplayName(uid);
+
+    logData = "{\"uid\":\"" + uid + "\",\"name\":\"" + userName + "\",\"access\":\"" + status + "\",\"timestamp\":" + String(millis()) + "}";
+  } else if (logType == "KEYPAD") {
+    firebaseUrl = "https://" + String(firebaseHost) + "/access-logs-keypad.json?auth=" + String(firebaseAuth);
+
+    logData = "{\"access\":\"" + status + "\",\"password\":\"" + password + "\",\"timestamp\":" + String(millis()) + "}";
+  }
+
+  http.begin(firebaseUrl);
+  http.addHeader("Content-Type", "application/json");
+  int httpResponseCode = http.POST(logData);
+
+  if (httpResponseCode > 0) {
+    Serial.print("Firebase Response Code: ");
+    Serial.println(httpResponseCode);
+  } else {
+    Serial.print("Error sending data to Firebase. HTTP Error: ");
+    Serial.println(httpResponseCode);
+  }
+
+  http.end();
+}
+
+String getUserKeypadPass(String uid) {
+  HTTPClient http;
+  String firebaseUrl = "https://" + String(firebaseHost) + userDatabasePath + "/" + uid + ".json?auth=" + String(firebaseAuth);
+
+  if (http.begin(firebaseUrl)) {
+    int httpResponseCode = http.GET();
+    if (httpResponseCode > 0) {
+      String payload = http.getString();
+      DynamicJsonDocument doc(2048);
+      deserializeJson(doc, payload);
+
+      if (doc.containsKey("keypadPass")) {
+        String uidKeypadPass = doc["keypadPass"].as<String>();
+        Serial.print("Fetched UID: ");
+        Serial.println(uid);
+        Serial.print("Fetched KeypadPass: ");
+        Serial.println(uidKeypadPass);
+        http.end();
+        return uidKeypadPass;
+      }
+    } else {
+      Serial.print("Error fetching keypadPass. HTTP Error: ");
+      Serial.println(httpResponseCode);
+    }
+
+    http.end();
+  } else {
+    Serial.println("Failed to connect to Firebase");
+  }
+
+  return "Not found"; // If the keypadPass is not found
+}
+
+void handlePasswordEntry(char key) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Enter password:");
+  lcd.setCursor(1, 1);
+  lcd.print(enteredPassword);
+}
+
+void handlePasswordSubmission(bool accessGranted) {
+  if (accessGranted) {
+    digitalWrite(LG_PIN, HIGH);
+    lcd.clear();
+    lcd.setCursor(1, 0);
+    lcd.print("Access Granted");
+    playMelody(1);
+    digitalWrite(LG_PIN, LOW);
+    digitalWrite(RELAY_PIN, HIGH);
+    sendAccessLogToFirebase("", "Access Granted", "KEYPAD", enteredPassword);
+    delay(1000);
+    digitalWrite(RELAY_PIN, LOW);
+  } else {
+    lcd.clear();
+    lcd.setCursor(1, 0);
+    lcd.print("Access Denied");
+    playMelody(0);
+    digitalWrite(LG_PIN, LOW);
+    digitalWrite(RELAY_PIN, LOW);
+    Serial.println("Access Denied");
+    sendAccessLogToFirebase("", "Access Denied", "KEYPAD", enteredPassword);
+  }
+  
+  enteredPassword = ""; // Clear the entered password
+  tagScanned = false;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Tap your card or");
+  lcd.setCursor(1, 1);
+  lcd.print("Enter your pin");
+}
+
+bool isUserRegistered(String uid) {
+  HTTPClient http;
+  String firebaseUrl = "https://" + String(firebaseHost) + userDatabasePath + ".json?auth=" + String(firebaseAuth);
+
+  if (http.begin(firebaseUrl)) {
+    int httpResponseCode = http.GET();
+    if (httpResponseCode > 0) {
+      String payload = http.getString();
+      DynamicJsonDocument doc(2048);
+      deserializeJson(doc, payload);
+
+      if (doc.containsKey(uid)) {
+        http.end();
+        return true;
+      }
+    } else {
+      Serial.print("Error checking user registration. HTTP Error: ");
+      Serial.println(httpResponseCode);
+    }
+
+    http.end();
+  } else {
+    Serial.println("Failed to connect to Firebase");
+  }
+
+  return false;
+}
+
+void fetchAndDisplayKeypadPass(String uid) {
+  String keypadPass = getUserKeypadPass(uid);
+
+  if (keypadPass != "Unknown") {
+    Serial.print("UID: ");
+    Serial.print(uid);
+    Serial.print(" | KeypadPass: ");
+    Serial.println(keypadPass);
+  } else {
+    Serial.print("UID: ");
+    Serial.print(uid);
+    Serial.println(" | KeypadPass: Not found");
+  }
+}
+
+bool checkUserAccess(String userEnteredPassword) {
+  HTTPClient http;
+  String firebaseUrl = "https://" + String(firebaseHost) + userDatabasePath + ".json?auth=" + String(firebaseAuth);
+
+  if (http.begin(firebaseUrl)) {
+    int httpResponseCode = http.GET();
+    if (httpResponseCode > 0) {
+      String payload = http.getString();
+      DynamicJsonDocument doc(2048);
+      deserializeJson(doc, payload);
+
+      if (doc.is<JsonObject>()) {
+        for (JsonPair entry : doc.as<JsonObject>()) {
+          String uid = entry.key().c_str();
+          JsonObject userData = entry.value().as<JsonObject>();
+
+          if (userData.containsKey("keypadPass")) {
+            String keypadPass = userData["keypadPass"].as<String>();
+            Serial.print("UID: ");
+            Serial.print(uid);
+            Serial.print(" | KeypadPass: ");
+            Serial.println(keypadPass);
+            Serial.print("Entered Password: ");
+            Serial.println(userEnteredPassword);
+            if (keypadPass == userEnteredPassword) {
+              Serial.println("Access Granted");
+              return true; // Access granted
+            }
+          }
+        }
+      }
+    } else {
+      Serial.print("Error fetching keypadPass. HTTP Error: ");
+      Serial.println(httpResponseCode);
+    }
+
+    http.end();
+  } else {
+    Serial.println("Failed to connect to Firebase");
+  }
+
+  Serial.println("Access Denied");
+  return false; // No match found
+}
+
+void loop() {
+  char key = keypad.getKey();
+
+  if (key != '\0') {
+    if (passwordMode) {
+      if (key >= '0' && key <= '9') {
+        enteredPassword += key;
+        handlePasswordEntry(key);
+      } else if (key == '#') {
+        passwordMode = false;
+        bool accessGranted = checkUserAccess(enteredPassword);
+
+        if (accessGranted) {
+          handlePasswordSubmission(true); // Pass true for access granted
+        } else {
+          handlePasswordSubmission(false); // Pass false for access denied
+        }
+
+        enteredPassword = "";
+        tagScanned = false;
+      }
+    } else if (key == '*') {
+      passwordMode = true;
+      enteredPassword = "";
+      handlePasswordEntry(key);
+    }
+  }
+
+  if (!tagScanned && !passwordMode) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Tap your card or");
+    lcd.setCursor(1, 1);
+    lcd.print("Enter your pin");
+    tagScanned = true;
+  }
+
+  if (rfid.PICC_IsNewCardPresent() || keypadEvent) {
+    if (rfid.PICC_ReadCardSerial()) {
+      tagScanned = false;
+      keypadEvent = false;
+      String rfidUid = "";
+      for (int i = 0; i < rfid.uid.size; i++) {
+        rfidUid += (rfid.uid.uidByte[i] < 0x10 ? "0" : "") + String(rfid.uid.uidByte[i], HEX);
+      }
+      rfidUid.toUpperCase();
+      const char* rfidUidChar = rfidUid.c_str();
+
+      if (isUserRegistered(rfidUid)) {
+        Serial.println("Access is granted");
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Access Granted");
+
+        digitalWrite(LG_PIN, HIGH);
+        digitalWrite(RELAY_PIN, HIGH);
+
+        playMelody(1);
+
+        unlockDoor();
+        sendAccessLogToFirebase(rfidUidChar, "Access Granted", "RFID", "");
+
+        accessGranted = true;
+        digitalWrite(LG_PIN, LOW);
+        digitalWrite(RELAY_PIN, LOW);
+        tagScanned = false;
+
+        lcd.setCursor(0, 0);
+        lcd.print("Tap your card or");
+        lcd.setCursor(1, 1);
+        lcd.print("Enter your pin");
+      } else {
+        Serial.print("Access denied, UID: ");
+        Serial.println(rfidUid);
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Access Denied");
+
+        digitalWrite(LG_PIN, LOW);
+        digitalWrite(RELAY_PIN, LOW);
+
+        playMelody(0);
+        sendAccessLogToFirebase(rfidUidChar, "Access Denied", "RFID", "");
+
+        accessGranted = false;
+        tagScanned = false;
+
+        lcd.setCursor(0, 0);
+        lcd.print("Tap your card or");
+        lcd.setCursor(1, 1);
+        lcd.print("Enter your pin");
+      }
+
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+    }
+  }
+}
